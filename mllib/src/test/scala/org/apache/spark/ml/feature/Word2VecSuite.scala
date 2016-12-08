@@ -18,15 +18,15 @@
 package org.apache.spark.ml.feature
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.ml.linalg.{Vector, Vectors}
 import org.apache.spark.ml.param.ParamsSuite
-import org.apache.spark.ml.util.MLTestingUtils
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
-import org.apache.spark.mllib.util.MLlibTestSparkContext
-import org.apache.spark.mllib.util.TestingUtils._
-import org.apache.spark.sql.{Row, SQLContext}
+import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTestingUtils}
+import org.apache.spark.ml.util.TestingUtils._
 import org.apache.spark.mllib.feature.{Word2VecModel => OldWord2VecModel}
+import org.apache.spark.mllib.util.MLlibTestSparkContext
+import org.apache.spark.sql.Row
 
-class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
+class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext with DefaultReadWriteTest {
 
   test("params") {
     ParamsSuite.checkParams(new Word2Vec)
@@ -35,8 +35,9 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("Word2Vec") {
-    val sqlContext = new SQLContext(sc)
-    import sqlContext.implicits._
+
+    val spark = this.spark
+    import spark.implicits._
 
     val sentence = "a b " * 100 + "a c " * 10
     val numOfWords = sentence.split(" ").size
@@ -77,8 +78,8 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
 
   test("getVectors") {
 
-    val sqlContext = new SQLContext(sc)
-    import sqlContext.implicits._
+    val spark = this.spark
+    import spark.implicits._
 
     val sentence = "a b " * 100 + "a c " * 10
     val doc = sc.parallelize(Seq(sentence, sentence)).map(line => line.split(" "))
@@ -99,7 +100,7 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
       .setSeed(42L)
       .fit(docDF)
 
-    val realVectors = model.getVectors.sort("word").select("vector").map {
+    val realVectors = model.getVectors.sort("word").select("vector").rdd.map {
       case Row(v: Vector) => v
     }.collect()
     // These expectations are just magic values, characterizing the current
@@ -118,8 +119,8 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
 
   test("findSynonyms") {
 
-    val sqlContext = new SQLContext(sc)
-    import sqlContext.implicits._
+    val spark = this.spark
+    import spark.implicits._
 
     val sentence = "a b " * 100 + "a c " * 10
     val doc = sc.parallelize(Seq(sentence, sentence)).map(line => line.split(" "))
@@ -132,16 +133,100 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
       .setSeed(42L)
       .fit(docDF)
 
-    val expectedSimilarity = Array(0.18032623242822343, -0.5717976464798823)
-    val (synonyms, similarity) = model.findSynonyms("a", 2).map {
+    val expectedSimilarity = Array(0.2608488929093532, -0.8271274846926078)
+    val (synonyms, similarity) = model.findSynonyms("a", 2).rdd.map {
       case Row(w: String, sim: Double) => (w, sim)
     }.collect().unzip
 
-    assert(synonyms.toArray === Array("b", "c"))
-    expectedSimilarity.zip(similarity).map {
+    assert(synonyms === Array("b", "c"))
+    expectedSimilarity.zip(similarity).foreach {
       case (expected, actual) => assert(math.abs((expected - actual) / expected) < 1E-5)
     }
-
   }
+
+  test("window size") {
+
+    val spark = this.spark
+    import spark.implicits._
+
+    val sentence = "a q s t q s t b b b s t m s t m q " * 100 + "a c " * 10
+    val doc = sc.parallelize(Seq(sentence, sentence)).map(line => line.split(" "))
+    val docDF = doc.zip(doc).toDF("text", "alsotext")
+
+    val model = new Word2Vec()
+      .setVectorSize(3)
+      .setWindowSize(2)
+      .setInputCol("text")
+      .setOutputCol("result")
+      .setSeed(42L)
+      .fit(docDF)
+
+    val (synonyms, similarity) = model.findSynonyms("a", 6).rdd.map {
+      case Row(w: String, sim: Double) => (w, sim)
+    }.collect().unzip
+
+    // Increase the window size
+    val biggerModel = new Word2Vec()
+      .setVectorSize(3)
+      .setInputCol("text")
+      .setOutputCol("result")
+      .setSeed(42L)
+      .setWindowSize(10)
+      .fit(docDF)
+
+    val (synonymsLarger, similarityLarger) = model.findSynonyms("a", 6).rdd.map {
+      case Row(w: String, sim: Double) => (w, sim)
+    }.collect().unzip
+    // The similarity score should be very different with the larger window
+    assert(math.abs(similarity(5) - similarityLarger(5) / similarity(5)) > 1E-5)
+  }
+
+  test("Word2Vec read/write") {
+    val t = new Word2Vec()
+      .setInputCol("myInputCol")
+      .setOutputCol("myOutputCol")
+      .setMaxIter(2)
+      .setMinCount(8)
+      .setNumPartitions(1)
+      .setSeed(42L)
+      .setStepSize(0.01)
+      .setVectorSize(100)
+      .setMaxSentenceLength(500)
+    testDefaultReadWrite(t)
+  }
+
+  test("Word2VecModel read/write") {
+    val word2VecMap = Map(
+      ("china", Array(0.50f, 0.50f, 0.50f, 0.50f)),
+      ("japan", Array(0.40f, 0.50f, 0.50f, 0.50f)),
+      ("taiwan", Array(0.60f, 0.50f, 0.50f, 0.50f)),
+      ("korea", Array(0.45f, 0.60f, 0.60f, 0.60f))
+    )
+    val oldModel = new OldWord2VecModel(word2VecMap)
+    val instance = new Word2VecModel("myWord2VecModel", oldModel)
+    val newInstance = testDefaultReadWrite(instance)
+    assert(newInstance.getVectors.collect() === instance.getVectors.collect())
+  }
+
+  test("Word2Vec works with input that is non-nullable (NGram)") {
+    val spark = this.spark
+    import spark.implicits._
+
+    val sentence = "a q s t q s t b b b s t m s t m q "
+    val docDF = sc.parallelize(Seq(sentence, sentence)).map(_.split(" ")).toDF("text")
+
+    val ngram = new NGram().setN(2).setInputCol("text").setOutputCol("ngrams")
+    val ngramDF = ngram.transform(docDF)
+
+    val model = new Word2Vec()
+      .setVectorSize(2)
+      .setInputCol("ngrams")
+      .setOutputCol("result")
+      .fit(ngramDF)
+
+    // Just test that this transformation succeeds
+    model.transform(ngramDF).collect()
+  }
+
 }
 

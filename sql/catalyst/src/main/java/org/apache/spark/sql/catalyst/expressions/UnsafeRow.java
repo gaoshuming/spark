@@ -31,6 +31,7 @@ import com.esotericsoftware.kryo.KryoSerializable;
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
 
+import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
@@ -58,7 +59,7 @@ import static org.apache.spark.unsafe.Platform.BYTE_ARRAY_OFFSET;
  *
  * Instances of `UnsafeRow` act as pointers to row data stored in this format.
  */
-public final class UnsafeRow extends MutableRow implements Externalizable, KryoSerializable {
+public final class UnsafeRow extends InternalRow implements Externalizable, KryoSerializable {
 
   //////////////////////////////////////////////////////////////////////////////
   // Static methods
@@ -66,6 +67,10 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
 
   public static int calculateBitSetWidthInBytes(int numFields) {
     return ((numFields + 63)/ 64) * 8;
+  }
+
+  public static int calculateFixedPortionByteSize(int numFields) {
+    return 8 * numFields + calculateBitSetWidthInBytes(numFields);
   }
 
   /**
@@ -116,11 +121,6 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
   /** The size of this row's backing data, in bytes) */
   private int sizeInBytes;
 
-  private void setNotNullAt(int i) {
-    assertIndexIsValid(i);
-    BitSetMethods.unset(baseObject, baseOffset, i);
-  }
-
   /** The width of the null tracking bit set, in bytes */
   private int bitSetWidthInBytes;
 
@@ -140,8 +140,16 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
   /**
    * Construct a new UnsafeRow. The resulting row won't be usable until `pointTo()` has been called,
    * since the value returned by this constructor is equivalent to a null pointer.
+   *
+   * @param numFields the number of fields in this row
    */
-  public UnsafeRow() { }
+  public UnsafeRow(int numFields) {
+    this.numFields = numFields;
+    this.bitSetWidthInBytes = calculateBitSetWidthInBytes(numFields);
+  }
+
+  // for serializer
+  public UnsafeRow() {}
 
   public Object getBaseObject() { return baseObject; }
   public long getBaseOffset() { return baseOffset; }
@@ -155,15 +163,12 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
    *
    * @param baseObject the base object
    * @param baseOffset the offset within the base object
-   * @param numFields the number of fields in this row
    * @param sizeInBytes the size of this row's backing data, in bytes
    */
-  public void pointTo(Object baseObject, long baseOffset, int numFields, int sizeInBytes) {
+  public void pointTo(Object baseObject, long baseOffset, int sizeInBytes) {
     assert numFields >= 0 : "numFields (" + numFields + ") should >= 0";
-    this.bitSetWidthInBytes = calculateBitSetWidthInBytes(numFields);
     this.baseObject = baseObject;
     this.baseOffset = baseOffset;
-    this.numFields = numFields;
     this.sizeInBytes = sizeInBytes;
   }
 
@@ -171,20 +176,19 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
    * Update this UnsafeRow to point to the underlying byte array.
    *
    * @param buf byte array to point to
-   * @param numFields the number of fields in this row
-   * @param sizeInBytes the number of bytes valid in the byte array
-   */
-  public void pointTo(byte[] buf, int numFields, int sizeInBytes) {
-    pointTo(buf, Platform.BYTE_ARRAY_OFFSET, numFields, sizeInBytes);
-  }
-
-  /**
-   * Updates this UnsafeRow preserving the number of fields.
-   * @param buf byte array to point to
    * @param sizeInBytes the number of bytes valid in the byte array
    */
   public void pointTo(byte[] buf, int sizeInBytes) {
-    pointTo(buf, numFields, sizeInBytes);
+    pointTo(buf, Platform.BYTE_ARRAY_OFFSET, sizeInBytes);
+  }
+
+  public void setTotalSize(int sizeInBytes) {
+    this.sizeInBytes = sizeInBytes;
+  }
+
+  public void setNotNullAt(int i) {
+    assertIndexIsValid(i);
+    BitSetMethods.unset(baseObject, baseOffset, i);
   }
 
   @Override
@@ -397,7 +401,7 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
       return null;
     }
     if (precision <= Decimal.MAX_LONG_DIGITS()) {
-      return Decimal.apply(getLong(ordinal), precision, scale);
+      return Decimal.createUnsafe(getLong(ordinal), precision, scale);
     } else {
       byte[] bytes = getBinary(ordinal);
       BigInteger bigInteger = new BigInteger(bytes);
@@ -456,8 +460,8 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
       final long offsetAndSize = getLong(ordinal);
       final int offset = (int) (offsetAndSize >> 32);
       final int size = (int) offsetAndSize;
-      final UnsafeRow row = new UnsafeRow();
-      row.pointTo(baseObject, baseOffset + offset, numFields, size);
+      final UnsafeRow row = new UnsafeRow(numFields);
+      row.pointTo(baseObject, baseOffset + offset, size);
       return row;
     }
   }
@@ -496,7 +500,7 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
    */
   @Override
   public UnsafeRow copy() {
-    UnsafeRow rowCopy = new UnsafeRow();
+    UnsafeRow rowCopy = new UnsafeRow(numFields);
     final byte[] rowDataCopy = new byte[sizeInBytes];
     Platform.copyMemory(
       baseObject,
@@ -505,7 +509,7 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
       Platform.BYTE_ARRAY_OFFSET,
       sizeInBytes
     );
-    rowCopy.pointTo(rowDataCopy, Platform.BYTE_ARRAY_OFFSET, numFields, sizeInBytes);
+    rowCopy.pointTo(rowDataCopy, Platform.BYTE_ARRAY_OFFSET, sizeInBytes);
     return rowCopy;
   }
 
@@ -514,8 +518,8 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
    * The returned row is invalid until we call copyFrom on it.
    */
   public static UnsafeRow createFromByteArray(int numBytes, int numFields) {
-    final UnsafeRow row = new UnsafeRow();
-    row.pointTo(new byte[numBytes], numFields, numBytes);
+    final UnsafeRow row = new UnsafeRow(numFields);
+    row.pointTo(new byte[numBytes], numBytes);
     return row;
   }
 
@@ -597,10 +601,9 @@ public final class UnsafeRow extends MutableRow implements Externalizable, KryoS
   public String toString() {
     StringBuilder build = new StringBuilder("[");
     for (int i = 0; i < sizeInBytes; i += 8) {
+      if (i != 0) build.append(',');
       build.append(java.lang.Long.toHexString(Platform.getLong(baseObject, baseOffset + i)));
-      build.append(',');
     }
-    build.deleteCharAt(build.length() - 1);
     build.append(']');
     return build.toString();
   }

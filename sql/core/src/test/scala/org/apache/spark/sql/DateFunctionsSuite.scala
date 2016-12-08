@@ -17,8 +17,9 @@
 
 package org.apache.spark.sql
 
-import java.sql.{Timestamp, Date}
+import java.sql.{Date, Timestamp}
 import java.text.SimpleDateFormat
+import java.util.Locale
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.functions._
@@ -55,8 +56,8 @@ class DateFunctionsSuite extends QueryTest with SharedSQLContext {
     checkAnswer(sql("""SELECT CURRENT_TIMESTAMP() = NOW()"""), Row(true))
   }
 
-  val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-  val sdfDate = new SimpleDateFormat("yyyy-MM-dd")
+  val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+  val sdfDate = new SimpleDateFormat("yyyy-MM-dd", Locale.US)
   val d = new Date(sdf.parse("2015-04-08 13:10:15").getTime)
   val ts = new Timestamp(sdf.parse("2013-04-08 13:10:15").getTime)
 
@@ -395,11 +396,11 @@ class DateFunctionsSuite extends QueryTest with SharedSQLContext {
   }
 
   test("from_unixtime") {
-    val sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    val sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
     val fmt2 = "yyyy-MM-dd HH:mm:ss.SSS"
-    val sdf2 = new SimpleDateFormat(fmt2)
+    val sdf2 = new SimpleDateFormat(fmt2, Locale.US)
     val fmt3 = "yy-MM-dd HH-mm-ss"
-    val sdf3 = new SimpleDateFormat(fmt3)
+    val sdf3 = new SimpleDateFormat(fmt3, Locale.US)
     val df = Seq((1000, "yyyy-MM-dd HH:mm:ss.SSS"), (-1000, "yy-MM-dd HH-mm-ss")).toDF("a", "b")
     checkAnswer(
       df.select(from_unixtime(col("a"))),
@@ -448,6 +449,9 @@ class DateFunctionsSuite extends QueryTest with SharedSQLContext {
       Row(date1.getTime / 1000L), Row(date2.getTime / 1000L)))
     checkAnswer(df.selectExpr(s"unix_timestamp(s, '$fmt')"), Seq(
       Row(ts1.getTime / 1000L), Row(ts2.getTime / 1000L)))
+
+    val now = sql("select unix_timestamp()").collect().head.getLong(0)
+    checkAnswer(sql(s"select cast ($now as timestamp)"), Row(new java.util.Date(now * 1000)))
   }
 
   test("to_unix_timestamp") {

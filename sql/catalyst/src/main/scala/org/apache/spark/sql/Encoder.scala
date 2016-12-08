@@ -17,137 +17,68 @@
 
 package org.apache.spark.sql
 
-import java.lang.reflect.Modifier
+import scala.annotation.implicitNotFound
+import scala.reflect.ClassTag
 
-import scala.reflect.{ClassTag, classTag}
-
-import org.apache.spark.sql.catalyst.encoders.{ExpressionEncoder, encoderFor}
-import org.apache.spark.sql.catalyst.expressions.{DecodeUsingSerializer, BoundReference, EncodeUsingSerializer}
+import org.apache.spark.annotation.{Experimental, InterfaceStability}
 import org.apache.spark.sql.types._
 
+
 /**
+ * :: Experimental ::
  * Used to convert a JVM object of type `T` to and from the internal Spark SQL representation.
  *
- * Encoders are not intended to be thread-safe and thus they are allow to avoid internal locking
- * and reuse internal buffers to improve performance.
+ * == Scala ==
+ * Encoders are generally created automatically through implicits from a `SparkSession`, or can be
+ * explicitly created by calling static methods on [[Encoders]].
+ *
+ * {{{
+ *   import spark.implicits._
+ *
+ *   val ds = Seq(1, 2, 3).toDS() // implicitly provided (spark.implicits.newIntEncoder)
+ * }}}
+ *
+ * == Java ==
+ * Encoders are specified by calling static methods on [[Encoders]].
+ *
+ * {{{
+ *   List<String> data = Arrays.asList("abc", "abc", "xyz");
+ *   Dataset<String> ds = context.createDataset(data, Encoders.STRING());
+ * }}}
+ *
+ * Encoders can be composed into tuples:
+ *
+ * {{{
+ *   Encoder<Tuple2<Integer, String>> encoder2 = Encoders.tuple(Encoders.INT(), Encoders.STRING());
+ *   List<Tuple2<Integer, String>> data2 = Arrays.asList(new scala.Tuple2(1, "a");
+ *   Dataset<Tuple2<Integer, String>> ds2 = context.createDataset(data2, encoder2);
+ * }}}
+ *
+ * Or constructed from Java Beans:
+ *
+ * {{{
+ *   Encoders.bean(MyClass.class);
+ * }}}
+ *
+ * == Implementation ==
+ *  - Encoders are not required to be thread-safe and thus they do not need to use locks to guard
+ *    against concurrent access if they reuse internal buffers to improve performance.
+ *
+ * @since 1.6.0
  */
+@Experimental
+@InterfaceStability.Evolving
+@implicitNotFound("Unable to find encoder for type stored in a Dataset.  Primitive types " +
+  "(Int, String, etc) and Product types (case classes) are supported by importing " +
+  "spark.implicits._  Support for serializing other types will be added in future " +
+  "releases.")
 trait Encoder[T] extends Serializable {
 
   /** Returns the schema of encoding this type of object as a Row. */
   def schema: StructType
 
-  /** A ClassTag that can be used to construct and Array to contain a collection of `T`. */
+  /**
+   * A ClassTag that can be used to construct and Array to contain a collection of `T`.
+   */
   def clsTag: ClassTag[T]
-}
-
-/**
- * Methods for creating encoders.
- */
-object Encoders {
-
-  def BOOLEAN: Encoder[java.lang.Boolean] = ExpressionEncoder(flat = true)
-  def BYTE: Encoder[java.lang.Byte] = ExpressionEncoder(flat = true)
-  def SHORT: Encoder[java.lang.Short] = ExpressionEncoder(flat = true)
-  def INT: Encoder[java.lang.Integer] = ExpressionEncoder(flat = true)
-  def LONG: Encoder[java.lang.Long] = ExpressionEncoder(flat = true)
-  def FLOAT: Encoder[java.lang.Float] = ExpressionEncoder(flat = true)
-  def DOUBLE: Encoder[java.lang.Double] = ExpressionEncoder(flat = true)
-  def STRING: Encoder[java.lang.String] = ExpressionEncoder(flat = true)
-
-  /**
-   * (Scala-specific) Creates an encoder that serializes objects of type T using Kryo.
-   * This encoder maps T into a single byte array (binary) field.
-   *
-   * T must be publicly accessible.
-   */
-  def kryo[T: ClassTag]: Encoder[T] = genericSerializer(useKryo = true)
-
-  /**
-   * Creates an encoder that serializes objects of type T using Kryo.
-   * This encoder maps T into a single byte array (binary) field.
-   *
-   * T must be publicly accessible.
-   */
-  def kryo[T](clazz: Class[T]): Encoder[T] = kryo(ClassTag[T](clazz))
-
-  /**
-   * (Scala-specific) Creates an encoder that serializes objects of type T using generic Java
-   * serialization. This encoder maps T into a single byte array (binary) field.
-   *
-   * Note that this is extremely inefficient and should only be used as the last resort.
-   *
-   * T must be publicly accessible.
-   */
-  def javaSerialization[T: ClassTag]: Encoder[T] = genericSerializer(useKryo = false)
-
-  /**
-   * Creates an encoder that serializes objects of type T using generic Java serialization.
-   * This encoder maps T into a single byte array (binary) field.
-   *
-   * Note that this is extremely inefficient and should only be used as the last resort.
-   *
-   * T must be publicly accessible.
-   */
-  def javaSerialization[T](clazz: Class[T]): Encoder[T] = javaSerialization(ClassTag[T](clazz))
-
-  /** Throws an exception if T is not a public class. */
-  private def validatePublicClass[T: ClassTag](): Unit = {
-    if (!Modifier.isPublic(classTag[T].runtimeClass.getModifiers)) {
-      throw new UnsupportedOperationException(
-        s"${classTag[T].runtimeClass.getName} is not a public class. " +
-          "Only public classes are supported.")
-    }
-  }
-
-  /** A way to construct encoders using generic serializers. */
-  private def genericSerializer[T: ClassTag](useKryo: Boolean): Encoder[T] = {
-    if (classTag[T].runtimeClass.isPrimitive) {
-      throw new UnsupportedOperationException("Primitive types are not supported.")
-    }
-
-    validatePublicClass[T]()
-
-    ExpressionEncoder[T](
-      schema = new StructType().add("value", BinaryType),
-      flat = true,
-      toRowExpressions = Seq(
-        EncodeUsingSerializer(
-          BoundReference(0, ObjectType(classOf[AnyRef]), nullable = true), kryo = useKryo)),
-      fromRowExpression =
-        DecodeUsingSerializer[T](
-          BoundReference(0, BinaryType, nullable = true), classTag[T], kryo = useKryo),
-      clsTag = classTag[T]
-    )
-  }
-
-  def tuple[T1, T2](
-      e1: Encoder[T1],
-      e2: Encoder[T2]): Encoder[(T1, T2)] = {
-    ExpressionEncoder.tuple(encoderFor(e1), encoderFor(e2))
-  }
-
-  def tuple[T1, T2, T3](
-      e1: Encoder[T1],
-      e2: Encoder[T2],
-      e3: Encoder[T3]): Encoder[(T1, T2, T3)] = {
-    ExpressionEncoder.tuple(encoderFor(e1), encoderFor(e2), encoderFor(e3))
-  }
-
-  def tuple[T1, T2, T3, T4](
-      e1: Encoder[T1],
-      e2: Encoder[T2],
-      e3: Encoder[T3],
-      e4: Encoder[T4]): Encoder[(T1, T2, T3, T4)] = {
-    ExpressionEncoder.tuple(encoderFor(e1), encoderFor(e2), encoderFor(e3), encoderFor(e4))
-  }
-
-  def tuple[T1, T2, T3, T4, T5](
-      e1: Encoder[T1],
-      e2: Encoder[T2],
-      e3: Encoder[T3],
-      e4: Encoder[T4],
-      e5: Encoder[T5]): Encoder[(T1, T2, T3, T4, T5)] = {
-    ExpressionEncoder.tuple(
-      encoderFor(e1), encoderFor(e2), encoderFor(e3), encoderFor(e4), encoderFor(e5))
-  }
 }

@@ -17,8 +17,10 @@
 
 package org.apache.spark.streaming
 
+import java.util.concurrent.ConcurrentLinkedQueue
+
+import scala.collection.JavaConverters._
 import scala.collection.mutable
-import scala.collection.mutable.{ArrayBuffer, SynchronizedBuffer}
 import scala.language.existentials
 import scala.reflect.ClassTag
 
@@ -74,7 +76,7 @@ class BasicOperationsSuite extends TestSuiteBase {
     assert(numInputPartitions === 2, "Number of input partitions has been changed from 2")
     val input = Seq(1 to 4, 5 to 8, 9 to 12)
     val output = Seq(Seq(3, 7), Seq(11, 15), Seq(19, 23))
-    val operation = (r: DStream[Int]) => r.mapPartitions(x => Iterator(x.reduce(_ + _)))
+    val operation = (r: DStream[Int]) => r.mapPartitions(x => Iterator(x.sum))
     testOperation(input, operation, output, true)
   }
 
@@ -84,9 +86,10 @@ class BasicOperationsSuite extends TestSuiteBase {
     withStreamingContext(setupStreams(input, operation, 2)) { ssc =>
       val output = runStreamsWithPartitions(ssc, 3, 3)
       assert(output.size === 3)
-      val first = output(0)
-      val second = output(1)
-      val third = output(2)
+      val outputArray = output.toArray
+      val first = outputArray(0)
+      val second = outputArray(1)
+      val third = outputArray(2)
 
       assert(first.size === 5)
       assert(second.size === 5)
@@ -104,9 +107,10 @@ class BasicOperationsSuite extends TestSuiteBase {
     withStreamingContext(setupStreams(input, operation, 5)) { ssc =>
       val output = runStreamsWithPartitions(ssc, 3, 3)
       assert(output.size === 3)
-      val first = output(0)
-      val second = output(1)
-      val third = output(2)
+      val outputArray = output.toArray
+      val first = outputArray(0)
+      val second = outputArray(1)
+      val third = outputArray(2)
 
       assert(first.size === 2)
       assert(second.size === 2)
@@ -186,7 +190,7 @@ class BasicOperationsSuite extends TestSuiteBase {
     val output = Seq(1 to 8, 101 to 108, 201 to 208)
     testOperation(
       input,
-      (s: DStream[Int]) => s.union(s.map(_ + 4)) ,
+      (s: DStream[Int]) => s.union(s.map(_ + 4)),
       output
     )
   }
@@ -467,6 +471,72 @@ class BasicOperationsSuite extends TestSuiteBase {
     testOperation(inputData, updateStateOperation, outputData, true)
   }
 
+  test("updateStateByKey - testing time stamps as input") {
+    type StreamingState = Long
+    val initial: Seq[(String, StreamingState)] = Seq(("a", 0L), ("c", 0L))
+
+    val inputData =
+      Seq(
+        Seq("a"),
+        Seq("a", "b"),
+        Seq("a", "b", "c"),
+        Seq("a", "b"),
+        Seq("a"),
+        Seq()
+      )
+
+    // a -> 1000, 3000, 6000, 10000, 15000, 15000
+    // b -> 0, 2000, 5000, 9000, 9000, 9000
+    // c -> 1000, 1000, 3000, 3000, 3000, 3000
+
+    val outputData: Seq[Seq[(String, StreamingState)]] = Seq(
+        Seq(
+          ("a", 1000L),
+          ("c", 0L)), // t = 1000
+        Seq(
+          ("a", 3000L),
+          ("b", 2000L),
+          ("c", 0L)), // t = 2000
+        Seq(
+          ("a", 6000L),
+          ("b", 5000L),
+          ("c", 3000L)), // t = 3000
+        Seq(
+          ("a", 10000L),
+          ("b", 9000L),
+          ("c", 3000L)), // t = 4000
+        Seq(
+          ("a", 15000L),
+          ("b", 9000L),
+          ("c", 3000L)), // t = 5000
+        Seq(
+          ("a", 15000L),
+          ("b", 9000L),
+          ("c", 3000L)) // t = 6000
+      )
+
+    val updateStateOperation = (s: DStream[String]) => {
+      val initialRDD = s.context.sparkContext.makeRDD(initial)
+      val updateFunc = (time: Time,
+                        key: String,
+                        values: Seq[Int],
+                        state: Option[StreamingState]) => {
+        // Update only if we receive values for this key during the batch.
+        if (values.nonEmpty) {
+          Option(time.milliseconds + state.getOrElse(0L))
+        } else {
+          Option(state.getOrElse(0L))
+        }
+      }
+      s.map(x => (x, 1)).updateStateByKey[StreamingState](updateFunc = updateFunc,
+        partitioner = new HashPartitioner (numInputPartitions), rememberPartitioner = false,
+        initialRDD = Option(initialRDD))
+    }
+
+    testOperation(input = inputData, operation = updateStateOperation,
+      expectedOutput = outputData, useSet = true)
+  }
+
   test("updateStateByKey - with initial value RDD") {
     val initial = Seq(("a", 1), ("c", 2))
 
@@ -534,10 +604,9 @@ class BasicOperationsSuite extends TestSuiteBase {
         val stateObj = state.getOrElse(new StateObject)
         values.sum match {
           case 0 => stateObj.expireCounter += 1 // no new values
-          case n => { // has new values, increment and reset expireCounter
+          case n => // has new values, increment and reset expireCounter
             stateObj.counter += n
             stateObj.expireCounter = 0
-          }
         }
         stateObj.expireCounter match {
           case 2 => None // seen twice with no new values, give it the boot
@@ -645,8 +714,8 @@ class BasicOperationsSuite extends TestSuiteBase {
         val networkStream =
           ssc.socketTextStream("localhost", testServer.port, StorageLevel.MEMORY_AND_DISK)
         val mappedStream = networkStream.map(_ + ".").persist()
-        val outputBuffer = new ArrayBuffer[Seq[String]] with SynchronizedBuffer[Seq[String]]
-        val outputStream = new TestOutputStream(mappedStream, outputBuffer)
+        val outputQueue = new ConcurrentLinkedQueue[Seq[String]]
+        val outputStream = new TestOutputStream(mappedStream, outputQueue)
 
         outputStream.register()
         ssc.start()
@@ -685,7 +754,7 @@ class BasicOperationsSuite extends TestSuiteBase {
         testServer.stop()
 
         // verify data has been received
-        assert(outputBuffer.size > 0)
+        assert(!outputQueue.isEmpty)
         assert(blockRdds.size > 0)
         assert(persistentRddIds.size > 0)
 

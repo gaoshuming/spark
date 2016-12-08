@@ -17,20 +17,37 @@
 
 package org.apache.spark.mllib.stat.test
 
-import org.apache.spark.Logging
-import org.apache.spark.annotation.{Experimental, Since}
-import org.apache.spark.rdd.RDD
+import scala.beans.BeanInfo
+
+import org.apache.spark.annotation.Since
+import org.apache.spark.internal.Logging
+import org.apache.spark.streaming.api.java.JavaDStream
 import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.util.StatCounter
 
 /**
- * :: Experimental ::
+ * Class that represents the group and value of a sample.
+ *
+ * @param isExperiment if the sample is of the experiment group.
+ * @param value numeric value of the observation.
+ */
+@Since("1.6.0")
+@BeanInfo
+case class BinarySample @Since("1.6.0") (
+    @Since("1.6.0") isExperiment: Boolean,
+    @Since("1.6.0") value: Double) {
+  override def toString: String = {
+    s"($isExperiment, $value)"
+  }
+}
+
+/**
  * Performs online 2-sample significance testing for a stream of (Boolean, Double) pairs. The
  * Boolean identifies which sample each observation comes from, and the Double is the numeric value
  * of the observation.
  *
  * To address novelty affects, the `peacePeriod` specifies a set number of initial
- * [[org.apache.spark.rdd.RDD]] batches of the [[DStream]] to be dropped from significance testing.
+ * [[org.apache.spark.rdd.RDD]] batches of the `DStream` to be dropped from significance testing.
  *
  * The `windowSize` sets the number of batches each significance test is to be performed over. The
  * window is sliding with a stride length of 1 batch. Setting windowSize to 0 will perform
@@ -49,7 +66,6 @@ import org.apache.spark.util.StatCounter
  *     .registerStream(DStream)
  * }}}
  */
-@Experimental
 @Since("1.6.0")
 class StreamingTest @Since("1.6.0") () extends Logging with Serializable {
   private var peacePeriod: Int = 0
@@ -81,15 +97,15 @@ class StreamingTest @Since("1.6.0") () extends Logging with Serializable {
   }
 
   /**
-   * Register a [[DStream]] of values for significance testing.
+   * Register a `DStream` of values for significance testing.
    *
-   * @param data stream of (key,value) pairs where the key denotes group membership (true =
-   *             experiment, false = control) and the value is the numerical metric to test for
-   *             significance
+   * @param data stream of BinarySample(key,value) pairs where the key denotes group membership
+   *             (true = experiment, false = control) and the value is the numerical metric to
+   *             test for significance
    * @return stream of significance testing results
    */
   @Since("1.6.0")
-  def registerStream(data: DStream[(Boolean, Double)]): DStream[StreamingTestResult] = {
+  def registerStream(data: DStream[BinarySample]): DStream[StreamingTestResult] = {
     val dataAfterPeacePeriod = dropPeacePeriod(data)
     val summarizedData = summarizeByKeyAndWindow(dataAfterPeacePeriod)
     val pairedSummaries = pairSummaries(summarizedData)
@@ -97,9 +113,22 @@ class StreamingTest @Since("1.6.0") () extends Logging with Serializable {
     testMethod.doTest(pairedSummaries)
   }
 
+  /**
+   * Register a `JavaDStream` of values for significance testing.
+   *
+   * @param data stream of BinarySample(isExperiment,value) pairs where the isExperiment denotes
+   *             group (true = experiment, false = control) and the value is the numerical metric
+   *             to test for significance
+   * @return stream of significance testing results
+   */
+  @Since("1.6.0")
+  def registerStream(data: JavaDStream[BinarySample]): JavaDStream[StreamingTestResult] = {
+    JavaDStream.fromDStream(registerStream(data.dstream))
+  }
+
   /** Drop all batches inside the peace period. */
   private[stat] def dropPeacePeriod(
-      data: DStream[(Boolean, Double)]): DStream[(Boolean, Double)] = {
+      data: DStream[BinarySample]): DStream[BinarySample] = {
     data.transform { (rdd, time) =>
       if (time.milliseconds > data.slideDuration.milliseconds * peacePeriod) {
         rdd
@@ -111,9 +140,10 @@ class StreamingTest @Since("1.6.0") () extends Logging with Serializable {
 
   /** Compute summary statistics over each key and the specified test window size. */
   private[stat] def summarizeByKeyAndWindow(
-      data: DStream[(Boolean, Double)]): DStream[(Boolean, StatCounter)] = {
+      data: DStream[BinarySample]): DStream[(Boolean, StatCounter)] = {
+    val categoryValuePair = data.map(sample => (sample.isExperiment, sample.value))
     if (this.windowSize == 0) {
-      data.updateStateByKey[StatCounter](
+      categoryValuePair.updateStateByKey[StatCounter](
         (newValues: Seq[Double], oldSummary: Option[StatCounter]) => {
           val newSummary = oldSummary.getOrElse(new StatCounter())
           newSummary.merge(newValues)
@@ -121,7 +151,7 @@ class StreamingTest @Since("1.6.0") () extends Logging with Serializable {
         })
     } else {
       val windowDuration = data.slideDuration * this.windowSize
-      data
+      categoryValuePair
         .groupByKeyAndWindow(windowDuration)
         .mapValues { values =>
           val summary = new StatCounter()

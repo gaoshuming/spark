@@ -20,6 +20,7 @@ package org.apache.spark.util.collection
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark._
+import org.apache.spark.internal.config._
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.memory.MemoryTestingUtils
 
@@ -230,15 +231,19 @@ class ExternalAppendOnlyMapSuite extends SparkFunSuite with LocalSparkContext {
     }
   }
 
+  test("spilling with compression and encryption") {
+    testSimpleSpilling(Some(CompressionCodec.DEFAULT_COMPRESSION_CODEC), encrypt = true)
+  }
+
   /**
    * Test spilling through simple aggregations and cogroups.
    * If a compression codec is provided, use it. Otherwise, do not compress spills.
    */
-  private def testSimpleSpilling(codec: Option[String] = None): Unit = {
+  private def testSimpleSpilling(codec: Option[String] = None, encrypt: Boolean = false): Unit = {
     val size = 1000
     val conf = createSparkConf(loadDefaults = true, codec)  // Load defaults for Spark home
-    conf.set("spark.shuffle.manager", "hash") // avoid using external sorter
     conf.set("spark.shuffle.spill.numElementsForceSpillThreshold", (size / 4).toString)
+    conf.set(IO_ENCRYPTION_ENABLED, encrypt)
     sc = new SparkContext("local-cluster[1,1,1024]", "test", conf)
 
     assertSpilled(sc, "reduceByKey") {
@@ -401,7 +406,6 @@ class ExternalAppendOnlyMapSuite extends SparkFunSuite with LocalSparkContext {
   test("external aggregation updates peak execution memory") {
     val spillThreshold = 1000
     val conf = createSparkConf(loadDefaults = false)
-      .set("spark.shuffle.manager", "hash") // make sure we're not also using ExternalSorter
       .set("spark.shuffle.spill.numElementsForceSpillThreshold", spillThreshold.toString)
     sc = new SparkContext("local", "test", conf)
     // No spilling
@@ -416,6 +420,21 @@ class ExternalAppendOnlyMapSuite extends SparkFunSuite with LocalSparkContext {
         sc.parallelize(1 to spillThreshold * 3, 2).map { i => (i, i) }.reduceByKey(_ + _).count()
       }
     }
+  }
+
+  test("force to spill for external aggregation") {
+    val conf = createSparkConf(loadDefaults = false)
+      .set("spark.shuffle.memoryFraction", "0.01")
+      .set("spark.memory.useLegacyMode", "true")
+      .set("spark.testing.memory", "100000000")
+      .set("spark.shuffle.sort.bypassMergeThreshold", "0")
+    sc = new SparkContext("local", "test", conf)
+    val N = 2e5.toInt
+    sc.parallelize(1 to N, 2)
+      .map { i => (i, i) }
+      .groupByKey()
+      .reduceByKey(_ ++ _)
+      .count()
   }
 
 }

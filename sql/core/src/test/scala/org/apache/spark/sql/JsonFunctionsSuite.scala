@@ -17,7 +17,9 @@
 
 package org.apache.spark.sql
 
+import org.apache.spark.sql.functions.{from_json, struct, to_json}
 import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.types.{CalendarIntervalType, IntegerType, StructType}
 
 class JsonFunctionsSuite extends QueryTest with SharedSQLContext {
   import testImplicits._
@@ -29,7 +31,6 @@ class JsonFunctionsSuite extends QueryTest with SharedSQLContext {
       Row("alice", "5"))
   }
 
-
   val tuples: Seq[(String, String)] =
     ("1", """{"f1": "value1", "f2": "value2", "f3": 3, "f5": 5.23}""") ::
     ("2", """{"f1": "value12", "f3": "value3", "f2": 2, "f4": 4.01}""") ::
@@ -38,6 +39,26 @@ class JsonFunctionsSuite extends QueryTest with SharedSQLContext {
     ("5", """{"f1": "", "f5": null}""") ::
     ("6", "[invalid JSON string]") ::
     Nil
+
+  test("function get_json_object - null") {
+    val df: DataFrame = tuples.toDF("key", "jstring")
+    val expected =
+      Row("1", "value1", "value2", "3", null, "5.23") ::
+        Row("2", "value12", "2", "value3", "4.01", null) ::
+        Row("3", "value13", "2", "value33", "value44", "5.01") ::
+        Row("4", null, null, null, null, null) ::
+        Row("5", "", null, null, null, null) ::
+        Row("6", null, null, null, null, null) ::
+        Nil
+
+    checkAnswer(
+      df.select($"key", functions.get_json_object($"jstring", "$.f1"),
+        functions.get_json_object($"jstring", "$.f2"),
+        functions.get_json_object($"jstring", "$.f3"),
+        functions.get_json_object($"jstring", "$.f4"),
+        functions.get_json_object($"jstring", "$.f5")),
+      expected)
+  }
 
   test("json_tuple select") {
     val df: DataFrame = tuples.toDF("key", "jstring")
@@ -52,6 +73,10 @@ class JsonFunctionsSuite extends QueryTest with SharedSQLContext {
 
     checkAnswer(
       df.select($"key", functions.json_tuple($"jstring", "f1", "f2", "f3", "f4", "f5")),
+      expected)
+
+    checkAnswer(
+      df.selectExpr("key", "json_tuple(jstring, 'f1', 'f2', 'f3', 'f4', 'f5')"),
       expected)
   }
 
@@ -69,5 +94,65 @@ class JsonFunctionsSuite extends QueryTest with SharedSQLContext {
       Nil
 
     checkAnswer(expr, expected)
+  }
+
+  test("from_json") {
+    val df = Seq("""{"a": 1}""").toDS()
+    val schema = new StructType().add("a", IntegerType)
+
+    checkAnswer(
+      df.select(from_json($"value", schema)),
+      Row(Row(1)) :: Nil)
+  }
+
+  test("from_json missing columns") {
+    val df = Seq("""{"a": 1}""").toDS()
+    val schema = new StructType().add("b", IntegerType)
+
+    checkAnswer(
+      df.select(from_json($"value", schema)),
+      Row(Row(null)) :: Nil)
+  }
+
+  test("from_json invalid json") {
+    val df = Seq("""{"a" 1}""").toDS()
+    val schema = new StructType().add("a", IntegerType)
+
+    checkAnswer(
+      df.select(from_json($"value", schema)),
+      Row(null) :: Nil)
+  }
+
+  test("to_json") {
+    val df = Seq(Tuple1(Tuple1(1))).toDF("a")
+
+    checkAnswer(
+      df.select(to_json($"a")),
+      Row("""{"_1":1}""") :: Nil)
+  }
+
+  test("to_json unsupported type") {
+    val df = Seq(Tuple1(Tuple1("interval -3 month 7 hours"))).toDF("a")
+      .select(struct($"a._1".cast(CalendarIntervalType).as("a")).as("c"))
+    val e = intercept[AnalysisException]{
+      // Unsupported type throws an exception
+      df.select(to_json($"c")).collect()
+    }
+    assert(e.getMessage.contains(
+      "Unable to convert column a of type calendarinterval to JSON."))
+  }
+
+  test("roundtrip in to_json and from_json") {
+    val dfOne = Seq(Tuple1(Tuple1(1)), Tuple1(null)).toDF("struct")
+    val schemaOne = dfOne.schema(0).dataType.asInstanceOf[StructType]
+    val readBackOne = dfOne.select(to_json($"struct").as("json"))
+      .select(from_json($"json", schemaOne).as("struct"))
+    checkAnswer(dfOne, readBackOne)
+
+    val dfTwo = Seq(Some("""{"a":1}"""), None).toDF("json")
+    val schemaTwo = new StructType().add("a", IntegerType)
+    val readBackTwo = dfTwo.select(from_json($"json", schemaTwo).as("struct"))
+      .select(to_json($"struct").as("json"))
+    checkAnswer(dfTwo, readBackTwo)
   }
 }
